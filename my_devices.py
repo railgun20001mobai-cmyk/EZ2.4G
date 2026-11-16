@@ -1474,18 +1474,11 @@ def _ring_pen(rgb, width: int) -> int:
                               ctypes.byref(lb), 0, None)
 
 
-# 电量圆环的几何参数（以 32×32 画布为基准）
-RING_RADIUS = 11.0   # 环的中径
-RING_WIDTH = 8.0     # 环的线宽（原版 4.0：托盘 16px 下只有 2px，几乎看不出）
-
-
-def tray_icon_size() -> int:
-    """按系统小图标尺寸渲染，避免 Windows 把 32px 图标缩小后再糊掉。"""
-    try:
-        n = int(user32.GetSystemMetrics(49))   # SM_CXSMICON
-    except Exception:
-        n = 0
-    return n if n >= 16 else 32
+# 电量圆环的几何参数（以 32×32 画布为基准，单位是半径像素）
+RING_INNER = 10.0    # 内径：中间留白不变
+RING_OUTER = 15.5    # 外径：向外扩展，环更饱满
+RING_RADIUS = (RING_INNER + RING_OUTER) / 2.0
+RING_WIDTH = RING_OUTER - RING_INNER
 
 
 def make_battery_icon(level: Optional[int], light: bool,
@@ -4707,8 +4700,7 @@ class Tray:
         k = (lvl is None, lvl, charging, self.app.theme_light)
         old = self.icons.get(nid.uID)
         if self.icon_keys.get(nid.uID) != k or not old:
-            icon = make_battery_icon(lvl, self.app.theme_light, charging,
-                                     size=tray_icon_size())
+            icon = make_battery_icon(lvl, self.app.theme_light, charging)
             self.icons[nid.uID] = icon
             self.icon_keys[nid.uID] = k
             nid.hIcon = icon
