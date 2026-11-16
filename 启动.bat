@@ -1,4 +1,9 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-start "" "C:\Users\Ap0\AppData\Local\Python\pythoncore-3.15-64\pythonw.exe" "%~dp0my_devices.py"
+where pythonw >nul 2>nul
+if %errorlevel%==0 (
+    start "" pythonw "%~dp0my_devices.py"
+) else (
+    start "" python "%~dp0my_devices.py"
+)

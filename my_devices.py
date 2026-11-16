@@ -1067,6 +1067,53 @@ def save_saved_devices(devs: list) -> None:
     save_config(cfg)
 
 
+# ---------------------------------------------------------------------------
+# 本地补丁：Yichip 2.4G 接收器（AJAZZ AJ179，VID:PID 248A:5B2F）
+# 电量只能在 Feature 0x0C 的设备信息块里读到，抓包协议（写 OUT + 读 IN）覆盖不了。
+# 请求：0C 01 20 00 <seq> 00 + 27*00
+# 回复：0C 01 20 00 <seq> 01 10 00 ... 第 18 字节 = 电量，第 19 字节 = 充电中
+# ---------------------------------------------------------------------------
+AJ179_FEATURE_IDS = {(0x248A, 0x5B2F)}
+
+
+def yichip_feature_read(ifaces: list, vid: int, pid: int) -> Optional[Reading]:
+    for d in ifaces:
+        if d.vid != vid or d.pid != pid or d.feature_len < 33:
+            continue
+        dev = None
+        try:
+            dev = HidDevice(d.path, write=True)
+            for i in range(2):
+                seq = (int(time.time() * 20) + i) & 0xFF
+                req = bytes([0x0C, 0x01, 0x20, 0x00, seq, 0x00]) + bytes(27)
+                if not dev.set_feature(req):
+                    continue
+                time.sleep(0.12)
+                rep = dev.get_feature_report(0x0C, 33)
+                if not rep or len(rep) < 20:
+                    continue
+                if rep[0] != 0x0C or rep[1] != 0x01 or rep[5] != 0x01:
+                    continue
+                level = rep[18]
+                if not 0 <= level <= 100:
+                    continue
+                return Reading(
+                    ok=True, level=level,
+                    status="charging" if rep[19] else "discharging",
+                    source="AJ179 电量（Feature 0x0C）",
+                    detail=f"原始 {rep[:24].hex(' ')}", raw=rep,
+                    vid=vid, pid=pid)
+        except Exception:
+            pass
+        finally:
+            if dev is not None:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+    return None
+
+
 def read_saved_device(dev: dict, ifaces=None) -> Reading:
     vid = int(dev["vid"])
     pid = int(dev["pid"])
@@ -1093,20 +1140,25 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
         if rr and rr.ok and rr.level is not None:
             r = rr
             break
+    if (not r or not r.ok) and (vid, pid) in AJ179_FEATURE_IDS:
+        rr = yichip_feature_read(cand, vid, pid)
+        if rr and rr.ok:
+            r = rr
     key = f"{vid:04X}:{pid:04X}"
     proto = user_protocols().get(key)
     if not r or not r.ok:
-        if proto is not None and proto.get("kind", "captured") != "standard":
+        if (proto is not None and proto.get("kind", "captured") != "standard"
+                and (vid, pid) not in AJ179_FEATURE_IDS):
             try:
                 rr = _read_user_protocol(cand, proto)
                 if rr and rr.ok:
                     r = rr
             except Exception:
                 pass
-    elif proto is None:
+    elif proto is None and (vid, pid) not in AJ179_FEATURE_IDS:
         # 标准 HID 能直接读：保存成协议，之后休眠也算“有协议”
         save_standard_protocol(vid, pid)
-    supported = key in user_protocols()
+    supported = key in user_protocols() or (vid, pid) in AJ179_FEATURE_IDS
     if r is None:
         r = Reading(
             ok=False, present=True, name=name,
@@ -1115,9 +1167,11 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
                     else "协议未知，无法读取电量"))
     elif not r.ok and supported:
         r.status = "asleep"
-        r.source = ("标准 HID 电量"
-                    if proto is not None and proto.get("kind") == "standard"
-                    else "抓包协议")
+        r.source = ("AJ179 电量（Feature 0x0C）"
+                    if (vid, pid) in AJ179_FEATURE_IDS else
+                    ("标准 HID 电量"
+                     if proto is not None and proto.get("kind") == "standard"
+                     else "抓包协议"))
         r.detail = "设备休眠"
     r.name = name
     r.present = True
@@ -1186,7 +1240,7 @@ def discover_extras(ifaces: list[HidIface]) -> dict[str, Reading]:
     groups: dict[str, dict] = {}
     known = known_ids()
     for d in ifaces:
-        if (d.vid, d.pid) in known:
+        if (d.vid, d.pid) in known or (d.vid, d.pid) in AJ179_FEATURE_IDS:
             continue
         if d.usage_page < 0xFF00:
             continue
@@ -1386,6 +1440,10 @@ gdi32.CreateCompatibleBitmap.restype = wt.HBITMAP
 COLORREF = lambda r, g, b: (r & 0xFF) | ((g & 0xFF) << 8) | ((b & 0xFF) << 16)
 
 
+# 电量配色：充电=蓝色，其余按电量高低绿/橙/红
+CHARGING_COLOR = (59, 130, 246)      # 充电中
+
+
 def _level_color(level: Optional[int]) -> tuple[int, int, int]:
     if level is None:
         return (120, 128, 140)
@@ -1414,6 +1472,20 @@ def _ring_pen(rgb, width: int) -> int:
     gdi32.ExtCreatePen.restype = wt.HPEN
     return gdi32.ExtCreatePen(0x00010000 | 0x00000200, width,
                               ctypes.byref(lb), 0, None)
+
+
+# 电量圆环的几何参数（以 32×32 画布为基准）
+RING_RADIUS = 11.0   # 环的中径
+RING_WIDTH = 8.0     # 环的线宽（原版 4.0：托盘 16px 下只有 2px，几乎看不出）
+
+
+def tray_icon_size() -> int:
+    """按系统小图标尺寸渲染，避免 Windows 把 32px 图标缩小后再糊掉。"""
+    try:
+        n = int(user32.GetSystemMetrics(49))   # SM_CXSMICON
+    except Exception:
+        n = 0
+    return n if n >= 16 else 32
 
 
 def make_battery_icon(level: Optional[int], light: bool,
@@ -1446,8 +1518,8 @@ def make_battery_icon(level: Optional[int], light: bool,
         # 电量：暗色轨道圆 + 顺时针进度弧
         s = big / 32.0
         cx = cy = big / 2.0
-        radius = 12.0 * s
-        thick = max(2, int(round(4 * s)))
+        radius = RING_RADIUS * s
+        thick = max(2, int(round(RING_WIDTH * s)))
         track = (95, 98, 105) if not light else (175, 180, 188)
         pen_track = _ring_pen(track, thick)
         gdi32.SelectObject(memdc, pen_track)
@@ -1457,7 +1529,7 @@ def make_battery_icon(level: Optional[int], light: bool,
                       int(cx + radius), int(cy + radius))
         if level is not None:
             if charging:
-                r, g, b = 34, 197, 94          # 充电：弧线绿色
+                r, g, b = CHARGING_COLOR       # 充电：弧线蓝色
             else:
                 r, g, b = _level_color(level)
             pen_arc = _ring_pen((r, g, b), thick)
@@ -4635,7 +4707,8 @@ class Tray:
         k = (lvl is None, lvl, charging, self.app.theme_light)
         old = self.icons.get(nid.uID)
         if self.icon_keys.get(nid.uID) != k or not old:
-            icon = make_battery_icon(lvl, self.app.theme_light, charging)
+            icon = make_battery_icon(lvl, self.app.theme_light, charging,
+                                     size=tray_icon_size())
             self.icons[nid.uID] = icon
             self.icon_keys[nid.uID] = k
             nid.hIcon = icon
@@ -4690,7 +4763,7 @@ class Tray:
         if msg == WM_TRAYICON:
             cmd = lparam & 0xFFFF
             if cmd == WM_RBUTTONUP:
-                self.app.request_show()
+                self.app.request_toggle()
             elif cmd == WM_LBUTTONUP:
                 self.app.refresh()
             return 0
@@ -4750,6 +4823,7 @@ class TrayApp:
         self.panel: Optional[Panel] = None
         self._dirty = False
         self._show_requested = False
+        self._toggle_requested = False
         self._full: dict[str, bool] = {}
         self.devices = load_saved_devices()
         self._seen = None
@@ -4807,6 +4881,10 @@ class TrayApp:
     # -- 交互 --------------------------------------------------------------
     def request_show(self):
         self._show_requested = True
+
+    def request_toggle(self):
+        """托盘右键：窗口开着就收起，没开就打开。"""
+        self._toggle_requested = True
 
     def set_interval(self, sec) -> int:
         sec = clamp_interval(sec)
@@ -4939,6 +5017,12 @@ class TrayApp:
                 vid, pid = self._pending_add
                 self._pending_add = None
                 self._show_add(vid, pid)
+            if self._toggle_requested:
+                self._toggle_requested = False
+                if getattr(self.panel, "_visible", False):
+                    self.panel.hide()
+                else:
+                    self.panel.show()
             if self._show_requested:
                 self._show_requested = False
                 self.panel.show()
