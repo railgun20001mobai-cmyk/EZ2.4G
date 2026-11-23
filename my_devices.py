@@ -3698,6 +3698,7 @@ class Panel:
         self.root.bind("<MouseWheel>", self._on_wheel)
         self._built = False
         self._startup_var = startup_enabled()
+        self._watch_var = self.app.watch_new
         self.root.update_idletasks()
         hwnd = self.root.winfo_id()
         self.hwnd = hwnd
@@ -4173,7 +4174,9 @@ class Panel:
                     lambda e: cv.configure(cursor="hand2"))
         cv.tag_bind("upd_btn", "<Leave>",
                     lambda e: cv.configure(cursor=""))
-        self._check(380, 372, self._startup_var, "开机自启",
+        self._check(288, 372, self._watch_var, "识别新设备",
+                    lambda: self._toggle_watch())
+        self._check(378, 372, self._startup_var, "开机自启",
                     lambda: self._toggle_startup())
         self._button(472, 360, 64, 24, "最小化", self.hide, kind="ghost")
         cv.scale("all", 0, 0, self.S, self.S)
@@ -4513,6 +4516,13 @@ class Panel:
                     tags=(tag,), anchor="w")
         self.cv.tag_bind(tag, "<Button-1>", lambda e: cmd())
 
+    def _toggle_watch(self):
+        try:
+            self._watch_var = self.app.set_watch_new(not self._watch_var)
+            self.render()
+        except Exception as e:
+            messagebox.showerror("识别新设备", f"设置失败：{e}")
+
     def _toggle_startup(self):
         try:
             if self._startup_var:
@@ -4824,6 +4834,7 @@ class TrayApp:
         self._add_win = None
         self._last_poll = 0.0
         self._hotplug_requested = False
+        self.watch_new = load_config().get("watch_new", True) is not False
 
     # -- 数据 --------------------------------------------------------------
     def snapshot(self) -> dict[str, Reading]:
@@ -4878,6 +4889,20 @@ class TrayApp:
         """托盘右键：窗口开着就收起，没开就打开。"""
         self._toggle_requested = True
 
+    def set_watch_new(self, on: bool) -> bool:
+        """是否监听新插入的设备（关掉后不再弹「发现新设备」）。"""
+        on = bool(on)
+        self.watch_new = on
+        cfg = load_config()
+        cfg["watch_new"] = on
+        save_config(cfg)
+        if on:
+            # 重新取一次基线：已经插着的设备不会立刻弹窗，避免一次蹦出好几个
+            self._seen = None
+            self._asked = set()
+        self._dirty = True
+        return on
+
     def set_interval(self, sec) -> int:
         sec = clamp_interval(sec)
         if sec == self.interval:
@@ -4913,6 +4938,8 @@ class TrayApp:
         new = present - self._seen
         self._seen = present
         self._asked &= present
+        if not self.watch_new:
+            return
         for vid, pid in sorted(new):
             if (vid, pid) in self._asked:
                 continue
